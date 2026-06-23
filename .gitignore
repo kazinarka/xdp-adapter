@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.o
+*.bpf.o
+
+# Machine-local Claude Code settings (permissions, etc.)
+.claude/settings.local.json

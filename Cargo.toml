@@ -1,0 +1,35 @@
+[package]
+name = "rxdp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Production-oriented AF_XDP (XDP socket) helpers in Rust for high-performance UDP ingest/egress, aimed at Solana validator + MEV workloads."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/illia-fedotov-dev/rxdp"
+readme = "README.md"
+keywords = ["xdp", "af_xdp", "networking", "solana", "ebpf"]
+categories = ["network-programming"]
+
+[dependencies]
+thiserror = "1"
+
+# xsk-rs links against libbpf and only builds on Linux. Declaring it as a
+# target-specific dependency means the pure-Rust core (config, packet parsing)
+# still compiles and unit-tests on macOS/Windows, while the AF_XDP transport is
+# only pulled in (and only compiled) on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+xsk-rs = "0.8"
+
+[[example]]
+name = "udp_rx"
+
+[[example]]
+name = "udp_tx"
+
+[profile.release]
+# Packet-processing hot loops benefit from aggressive inlining and a single
+# codegen unit. lto = "thin" keeps compile times reasonable while still letting
+# the optimizer cross module boundaries.
+lto = "thin"
+codegen-units = 1
+panic = "abort"
