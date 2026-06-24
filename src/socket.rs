@@ -21,7 +21,7 @@
 //!   COMPLETION ring, at which point we push it back onto the free list.
 
 use xsk_rs::{
-    config::{SocketConfig, UmemConfig},
+    config::{FrameSize, SocketConfig, UmemConfig},
     CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem,
 };
 
@@ -71,14 +71,20 @@ impl XdpSocket {
 
         let umem_config = UmemConfig::builder()
             .frame_size(
-                std::num::NonZeroU32::new(cfg.frame_size).expect("frame_size validated non-zero"),
+                FrameSize::new(cfg.frame_size)
+                    .map_err(|e| XdpError::Transport(format!("frame size: {e:?}")))?,
             )
             .build()
             .map_err(|e| XdpError::Transport(format!("umem config: {e:?}")))?;
 
         // `Umem::new` allocates the shared memory region and returns one
-        // FrameDesc per frame. The `false` = don't use huge pages.
-        let (umem, mut frames) = Umem::new(umem_config, frame_count(&cfg), false)
+        // FrameDesc per frame. It wants the frame count as a `NonZeroU32`; the
+        // count is already validated > 0, but convert explicitly so a bad value
+        // surfaces as a transport error rather than a panic. The `false` = don't
+        // use huge pages.
+        let frames_nz = std::num::NonZeroU32::new(frame_count(&cfg) as u32)
+            .ok_or_else(|| XdpError::Transport("frame_count must be non-zero".into()))?;
+        let (umem, mut frames) = Umem::new(umem_config, frames_nz, false)
             .map_err(|e| XdpError::Transport(format!("umem alloc: {e:?}")))?;
 
         let socket_config = SocketConfig::builder().build();
@@ -194,23 +200,27 @@ impl XdpSocket {
         self.reclaim_completions();
         let mut desc = self.tx_free.pop().ok_or(XdpError::NoFreeFrames)?;
 
+        // Stamp the per-socket IP id before borrowing the UMEM: `data_mut`
+        // borrows `self.umem` for the rest of this block, which would conflict
+        // with the `&mut self` that `next_ip_id` needs.
+        let mut spec = frame.clone();
+        spec.ip_id = self.next_ip_id();
+
         // Write directly into the UMEM frame — zero intermediate allocation.
         // SAFETY: `desc` is a TX-pool frame we own and that is on no ring.
-        let written = {
+        {
             let mut data = unsafe { self.umem.data_mut(&mut desc) };
-            let mut spec = frame.clone();
-            spec.ip_id = self.next_ip_id();
-            let mut cursor = data.cursor();
-            use std::io::Write;
-            // `encode` allocates; to stay zero-alloc we encode into the cursor's
-            // backing slice instead. The cursor exposes the full frame buffer.
-            let buf = cursor.get_mut();
-            let n = spec.encode_into(buf);
-            // Advance the cursor so the descriptor length is set correctly.
-            cursor.write_all(&[]).ok();
-            n
-        };
-        desc.set_len(written);
+            let total = spec.encoded_len();
+
+            // A fresh TX frame has data length 0, so `contents_mut()` would
+            // expose an empty slice. The cursor's position field *is* the
+            // frame descriptor's data length, so setting it to `total` both
+            // grows the writable region to the full encoded size and records
+            // the length the kernel will transmit — no separate `set_len`.
+            data.cursor().set_pos(total);
+            let n = spec.encode_into(data.contents_mut());
+            debug_assert_eq!(n, total);
+        }
 
         // Hand the frame to the TX ring and kick the kernel to transmit.
         // SAFETY: frame is now owned by the kernel until it appears on COMP.
